@@ -7,6 +7,10 @@
 #include <complex>
 #include <math.h>
 #include <fstream>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <vector>
 
 //Constants
 static const int target_fps = 60;
@@ -136,7 +140,64 @@ public:
   double play_nx, play_ny;
   double play_px, play_py;
 
-  Synth(HWND hwnd) : WinAudio(hwnd, sample_rate) {
+  Synth(HWND hwnd);
+
+  void SetPoint(double x, double y) {
+    play_nx = x;
+    play_ny = y;
+    audio_reset = true;
+    audio_pause = false;
+  }
+
+  virtual bool onGetData(Chunk& data) override;
+
+private:
+  static double clampd(double value, double min_value, double max_value);
+  double quantizeToScale(double freq) const;
+  double wrapPhase(double phase) const;
+  void resetAudioState();
+
+  double carrier_phase;
+  double mod_phase;
+  double carrier_freq;
+  double mod_freq;
+  double mod_index;
+  double stereo_width;
+  double delay_feedback;
+  double amplitude;
+  double target_carrier_freq;
+  double target_mod_freq;
+  double target_mod_index;
+  double target_stereo_width;
+  double target_delay_samples;
+  double target_delay_feedback;
+  double target_amplitude;
+  double current_delay_samples;
+  std::vector<double> delay_buffer_l;
+  std::vector<double> delay_buffer_r;
+  size_t delay_index;
+
+  static const int kMajorScale[7];
+  static const double max_delay_seconds;
+
+public:
+  int16_t m_samples[AUDIO_BUFF_SIZE];
+  int32_t m_audio_time;
+  double mean_x;
+  double mean_y;
+  double dx;
+  double dy;
+  double dpx;
+  double dpy;
+};
+
+const int Synth::kMajorScale[7] = {0, 2, 4, 5, 7, 9, 11};
+const double Synth::max_delay_seconds = 0.75;
+
+Synth::Synth(HWND hwnd)
+  : WinAudio(hwnd, sample_rate),
+    delay_buffer_l(static_cast<size_t>(sample_rate * max_delay_seconds) + 1, 0.0),
+    delay_buffer_r(static_cast<size_t>(sample_rate * max_delay_seconds) + 1, 0.0) {
     audio_reset = true;
     audio_pause = false;
     volume = 8000.0;
@@ -148,122 +209,228 @@ public:
     play_ny = 0.0;
     play_px = 0.0;
     play_py = 0.0;
+    carrier_phase = 0.0;
+    mod_phase = 0.0;
+    carrier_freq = 220.0;
+    mod_freq = 110.0;
+    mod_index = 1.0;
+    stereo_width = 0.25;
+    delay_feedback = 0.25;
+    amplitude = 0.6;
+    target_carrier_freq = carrier_freq;
+    target_mod_freq = mod_freq;
+    target_mod_index = mod_index;
+    target_stereo_width = stereo_width;
+    target_delay_samples = sample_rate * 0.12;
+    target_delay_feedback = delay_feedback;
+    target_amplitude = amplitude;
+    current_delay_samples = target_delay_samples;
+    delay_index = 0;
   }
 
-  void SetPoint(double x, double y) {
-    play_nx = x;
-    play_ny = y;
-    audio_reset = true;
-    audio_pause = false;
+double Synth::clampd(double value, double min_value, double max_value) {
+  if (value < min_value) {
+    return min_value;
+  }
+  if (value > max_value) {
+    return max_value;
+  }
+  return value;
+}
+
+double Synth::wrapPhase(double phase) const {
+  while (phase >= 2.0 * M_PI) {
+    phase -= 2.0 * M_PI;
+  }
+  while (phase < 0.0) {
+    phase += 2.0 * M_PI;
+  }
+  return phase;
+}
+
+double Synth::quantizeToScale(double freq) const {
+  if (freq <= 0.0) {
+    return 0.0;
+  }
+  const double midi = 69.0 + 12.0 * std::log2(freq / 440.0);
+  const double octave = std::floor(midi / 12.0);
+  const double note_in_octave = midi - octave * 12.0;
+  int best_step = kMajorScale[0];
+  double best_delta = std::abs(note_in_octave - kMajorScale[0]);
+  for (int step : kMajorScale) {
+    const double delta = std::abs(note_in_octave - step);
+    if (delta < best_delta) {
+      best_delta = delta;
+      best_step = step;
+    }
+  }
+  const double quantized_midi = octave * 12.0 + best_step;
+  return 440.0 * std::pow(2.0, (quantized_midi - 69.0) / 12.0);
+}
+
+void Synth::resetAudioState() {
+  m_audio_time = 0;
+  play_cx = (jx < 1e8 ? jx : play_nx);
+  play_cy = (jy < 1e8 ? jy : play_ny);
+  play_x = play_nx;
+  play_y = play_ny;
+  play_px = play_nx;
+  play_py = play_ny;
+  mean_x = play_nx;
+  mean_y = play_ny;
+  volume = 8000.0;
+  carrier_phase = 0.0;
+  mod_phase = 0.0;
+  carrier_freq = target_carrier_freq;
+  mod_freq = target_mod_freq;
+  mod_index = target_mod_index;
+  stereo_width = target_stereo_width;
+  delay_feedback = target_delay_feedback;
+  amplitude = target_amplitude;
+  current_delay_samples = target_delay_samples;
+  delay_index = 0;
+  std::fill(delay_buffer_l.begin(), delay_buffer_l.end(), 0.0);
+  std::fill(delay_buffer_r.begin(), delay_buffer_r.end(), 0.0);
+  audio_reset = false;
+}
+
+bool Synth::onGetData(Chunk& data) {
+  data.samples = m_samples;
+  data.sampleCount = AUDIO_BUFF_SIZE;
+  memset(m_samples, 0, sizeof(m_samples));
+
+  if (audio_reset) {
+    resetAudioState();
   }
 
-  virtual bool onGetData(Chunk& data) override {
-    //Setup the chunk info
-    data.samples = m_samples;
-    data.sampleCount = AUDIO_BUFF_SIZE;
-    memset(m_samples, 0, sizeof(m_samples));
+  if (audio_pause) {
+    return true;
+  }
 
-    //Check if audio needs to reset
-    if (audio_reset) {
-      m_audio_time = 0;
-      play_cx = (jx < 1e8 ? jx : play_nx);
-      play_cy = (jy < 1e8 ? jy : play_ny);
-      play_x = play_nx;
-      play_y = play_ny;
-      play_px = play_nx;
-      play_py = play_ny;
-      mean_x = play_nx;
-      mean_y = play_ny;
-      volume = 8000.0;
-      audio_reset = false;
-    }
+  const int steps = sample_rate / max_freq;
+  const double smoothing = 0.0025;
+  const double delay_smoothing = 0.01;
+  const double amplitude_smoothing = 0.01;
 
-    //Check if paused
-    if (audio_pause) {
-      return true;
-    }
-
-    //Generate the tones
-    const int steps = sample_rate / max_freq;
-    for (int i = 0; i < AUDIO_BUFF_SIZE; i+=2) {
-      const int j = m_audio_time % steps;
-      if (j == 0) {
-        play_px = play_x;
-        play_py = play_y;
-        fractal(play_x, play_y, play_cx, play_cy);
-        if (play_x*play_x + play_y*play_y > escape_radius_sq) {
-          audio_pause = true;
-          return true;
-        }
-
-        if (normalized) {
-          dpx = play_px - play_cx;
-          dpy = play_py - play_cy;
-          dx = play_x - play_cx;
-          dy = play_y - play_cy;
-          if (dx != 0.0 || dy != 0.0) {
-            double dpmag = 1.0 / std::sqrt(1e-12 + dpx*dpx + dpy*dpy);
-            double dmag = 1.0 / std::sqrt(1e-12 + dx*dx + dy*dy);
-            dpx *= dpmag;
-            dpy *= dpmag;
-            dx *= dmag;
-            dy *= dmag;
-          }
-        } else {
-          //Point is relative to mean
-          dx = play_x - mean_x;
-          dy = play_y - mean_y;
-          dpx = play_px - mean_x;
-          dpy = play_py - mean_y;
-        }
-
-        //Update mean
-        mean_x = mean_x*0.99 + play_x*0.01;
-        mean_y = mean_y*0.99 + play_y*0.01;
-
-        //Don't let the volume go to infinity, clamp.
-        double m = dx*dx + dy*dy;
-        if (m > 2.0) {
-          dx *= 2.0 / m;
-          dy *= 2.0 / m;
-        }
-        m = dpx*dpx + dpy*dpy;
-        if (m > 2.0) {
-          dpx *= 2.0 / m;
-          dpy *= 2.0 / m;
-        }
-
-        //Lose volume over time unless in sustain mode
-        if (!sustain) {
-          volume *= 0.9992;
-        }
+  for (int i = 0; i < AUDIO_BUFF_SIZE; i += 2) {
+    const int j = m_audio_time % steps;
+    if (j == 0) {
+      play_px = play_x;
+      play_py = play_y;
+      fractal(play_x, play_y, play_cx, play_cy);
+      if (play_x * play_x + play_y * play_y > escape_radius_sq) {
+        audio_pause = true;
+        return true;
       }
 
-      //Cosine interpolation
-      double t = double(j) / double(steps);
-      t = 0.5 - 0.5*std::cos(t * 3.14159);
-      double wx = t*dx + (1.0 - t)*dpx;
-      double wy = t*dy + (1.0 - t)*dpy;
+      if (normalized) {
+        dpx = play_px - play_cx;
+        dpy = play_py - play_cy;
+        dx = play_x - play_cx;
+        dy = play_y - play_cy;
+        if (dx != 0.0 || dy != 0.0) {
+          double dpmag = 1.0 / std::sqrt(1e-12 + dpx * dpx + dpy * dpy);
+          double dmag = 1.0 / std::sqrt(1e-12 + dx * dx + dy * dy);
+          dpx *= dpmag;
+          dpy *= dpmag;
+          dx *= dmag;
+          dy *= dmag;
+        }
+      } else {
+        dx = play_x - mean_x;
+        dy = play_y - mean_y;
+        dpx = play_px - mean_x;
+        dpy = play_py - mean_y;
+      }
 
-      //Save the audio to the 2 channels
-      m_samples[i]   = (int16_t)std::min(std::max(wx * volume, -32000.0), 32000.0);
-      m_samples[i+1] = (int16_t)std::min(std::max(wy * volume, -32000.0), 32000.0);
-      m_audio_time += 1;
+      mean_x = mean_x * 0.99 + play_x * 0.01;
+      mean_y = mean_y * 0.99 + play_y * 0.01;
+
+      const double center_x = play_x - play_cx;
+      const double center_y = play_y - play_cy;
+      const double orbit_mag = std::sqrt(center_x * center_x + center_y * center_y);
+      const double delta_x = play_x - play_px;
+      const double delta_y = play_y - play_py;
+      const double velocity = std::sqrt(delta_x * delta_x + delta_y * delta_y);
+      const double angle = std::atan2(center_y, center_x);
+
+      double raw_carrier = 80.0 + std::min(orbit_mag * 90.0 + velocity * 260.0, 1600.0);
+      raw_carrier = std::max(raw_carrier, 40.0);
+      const double quantized_carrier = std::max(quantizeToScale(raw_carrier), 40.0);
+      target_carrier_freq = std::min(quantized_carrier, 2000.0);
+
+      const double harmonic_ratio = 0.5 + std::abs(std::sin(angle)) * 1.5;
+      target_mod_freq = clampd(target_carrier_freq * harmonic_ratio, 30.0, 1800.0);
+
+      target_mod_index = clampd(0.2 + velocity * 6.0 + orbit_mag * 0.35, 0.25, 7.0);
+
+      const double width_target = 0.15 + std::abs(std::cos(angle)) * 0.75;
+      target_stereo_width = clampd(width_target, 0.0, 0.95);
+
+      const double fractional_orbit = orbit_mag - std::floor(orbit_mag);
+      target_delay_samples = clampd((0.05 + fractional_orbit * 0.45) * sample_rate,
+                                    sample_rate * 0.02,
+                                    sample_rate * max_delay_seconds - 2.0);
+
+      target_delay_feedback = clampd(0.18 + velocity * 2.4, 0.15, 0.82);
+
+      target_amplitude = clampd(0.45 + std::min(orbit_mag, 2.5) * 0.18, 0.3, 0.95);
+      if (!sustain) {
+        target_amplitude *= 0.65;
+      }
     }
 
-    //Return the sound clip
-    return !audio_reset;
+    carrier_freq += (target_carrier_freq - carrier_freq) * smoothing;
+    mod_freq += (target_mod_freq - mod_freq) * smoothing;
+    mod_index += (target_mod_index - mod_index) * smoothing;
+    stereo_width += (target_stereo_width - stereo_width) * (smoothing * 2.0);
+    delay_feedback += (target_delay_feedback - delay_feedback) * delay_smoothing;
+    current_delay_samples += (target_delay_samples - current_delay_samples) * delay_smoothing;
+    amplitude += (target_amplitude - amplitude) * amplitude_smoothing;
+
+    carrier_freq = std::max(20.0, carrier_freq);
+    mod_freq = std::max(10.0, mod_freq);
+    mod_index = std::max(0.1, mod_index);
+    stereo_width = clampd(stereo_width, 0.0, 0.99);
+    delay_feedback = clampd(delay_feedback, 0.0, 0.95);
+    amplitude = clampd(amplitude, 0.0, 1.2);
+
+    mod_phase += 2.0 * M_PI * mod_freq / double(sample_rate);
+    mod_phase = wrapPhase(mod_phase);
+    const double mod_signal = std::sin(mod_phase);
+
+    const double instantaneous_freq = std::max(10.0, carrier_freq + mod_signal * mod_freq * mod_index);
+    carrier_phase += 2.0 * M_PI * instantaneous_freq / double(sample_rate);
+    carrier_phase = wrapPhase(carrier_phase);
+    const double carrier_sample = std::sin(carrier_phase);
+
+    const double side = mod_signal * stereo_width;
+    double left = (carrier_sample + side) * amplitude;
+    double right = (carrier_sample - side) * amplitude;
+
+    const int delay_buffer_size = static_cast<int>(delay_buffer_l.size());
+    const int delay_tap = static_cast<int>(clampd(current_delay_samples, 1.0, delay_buffer_size - 1.0));
+    const int read_index = (static_cast<int>(delay_index) + delay_buffer_size - delay_tap) % delay_buffer_size;
+    const double delayed_l = delay_buffer_l[read_index];
+    const double delayed_r = delay_buffer_r[read_index];
+
+    double out_l = left + delayed_l;
+    double out_r = right + delayed_r;
+
+    delay_buffer_l[delay_index] = left + delayed_l * delay_feedback;
+    delay_buffer_r[delay_index] = right + delayed_r * delay_feedback;
+    delay_index = (delay_index + 1) % delay_buffer_l.size();
+
+    out_l = std::tanh(out_l);
+    out_r = std::tanh(out_r);
+
+    m_samples[i] = (int16_t)clampd(out_l * 30000.0, -32767.0, 32767.0);
+    m_samples[i + 1] = (int16_t)clampd(out_r * 30000.0, -32767.0, 32767.0);
+    m_audio_time += 1;
   }
 
-  int16_t m_samples[AUDIO_BUFF_SIZE];
-  int32_t m_audio_time;
-  double mean_x;
-  double mean_y;
-  double dx;
-  double dy;
-  double dpx;
-  double dpy;
-};
+  return !audio_reset;
+}
 
 //Change the fractal
 void SetFractal(sf::Shader& shader, int type, Synth& synth) {
@@ -574,7 +741,7 @@ int main(int argc, char *argv[]) {
         "  2 - Burning Ship\n"
         "  3 - Feather Fractal\n"
         "  4 - SFX Fractal\n"
-        "  5 - Hénon Map\n"
+        "  5 - Henon Map\n"
         "  6 - Duffing Map\n"
         "  7 - Ikeda Map\n"
         "  8 - Chirikov Map\n"
